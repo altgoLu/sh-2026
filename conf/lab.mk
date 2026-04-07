@@ -1,2 +1,3 @@
 LAB=sh
 LAB_NUM=1
+URL=http://114.212.81.7:9998
