@@ -7,7 +7,7 @@ info.mk like this:
 # conf/info.mk
 SID=123456789
 TOKEN=abcdefghijklmn123456789
-URL=http://123.456.789.0:9999
+URL=http://114.212.81.7:9998
 ```
 where `SID` is your student ID, `TOKEN` is the token we sent to your student email (student_id@smail.nju.edu.cn), and `URL` is the URL of the OJ server we provided.
 
