@@ -61,7 +61,8 @@ void print_blocked_syscall(char* syscall_name, int count, ...) {
 #define MAX_INPUT 1024
 #define MAX_TOKENS 128
 
-char input[MAX_INPUT];
+char *input = NULL;
+size_t input_cap = 0;
 
 struct command {
     char *argv[MAX_ARGS];
@@ -240,18 +241,25 @@ void execute(struct job *j) {
 int main() {
     while(1) {
         print_prompt();
-        if (fgets(input, sizeof(input), stdin) == NULL) {
+        ssize_t input_len = getline(&input, &input_cap, stdin);
+        if (input_len == -1) {
             break;
+        }
+        if (input_len >= MAX_INPUT) {
+            print_invalid_syntax();
+            continue;
         }
         tokenizer(input);
         struct job j;
         if (!parser(&j)) {
             print_invalid_syntax();
+        } else {
+            execute(&j);
         }
-        execute(&j);
 
 
         free_tokens();
     }
+    free(input);
     return 0;
 }
