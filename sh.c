@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <limits.h>
 
 //
 // You should use the following functions to print information
@@ -55,6 +56,10 @@ void print_blocked_syscall(char* syscall_name, int count, ...) {
     printf("\n");
     fflush(stdout);
 }
+
+#ifdef MAX_INPUT
+#undef MAX_INPUT
+#endif
 
 #define MAX_ARGS 32
 #define MAX_CMDS 16
@@ -296,6 +301,62 @@ static int setup_child_io(struct job *j, int index, int pipes[][2]) {
     return 1;
 }
 
+static int init_shell_env(void) {
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        return 0;
+    }
+
+    if (clearenv() != 0 ||
+        setenv("PATH", "/bin", 1) != 0 ||
+        setenv("HOME", cwd, 1) != 0 ||
+        setenv("PWD", cwd, 1) != 0 ||
+        setenv("OLDPWD", cwd, 1) != 0 ||
+        setenv("LANG", "en_US.UTF-8", 1) != 0 ||
+        setenv("SH_VERSION", "1.0", 1) != 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int run_cd(struct command *cmd) {
+    if (cmd->argc != 2) {
+        print_invalid_syntax();
+        return 0;
+    }
+
+    char oldpwd[PATH_MAX];
+    if (getcwd(oldpwd, sizeof(oldpwd)) == NULL) {
+        print_execution_error();
+        return 0;
+    }
+
+    char *target = cmd->argv[1];
+    if (strcmp(target, "~") == 0) {
+        target = getenv("HOME");
+    } else if (strcmp(target, "-") == 0) {
+        target = getenv("OLDPWD");
+    }
+
+    if (target == NULL || chdir(target) != 0) {
+        print_execution_error();
+        return 0;
+    }
+
+    char newpwd[PATH_MAX];
+    if (getcwd(newpwd, sizeof(newpwd)) == NULL) {
+        print_execution_error();
+        return 0;
+    }
+
+    if (setenv("OLDPWD", oldpwd, 1) != 0 || setenv("PWD", newpwd, 1) != 0) {
+        print_execution_error();
+    }
+
+    return 0;
+}
+
 int execute(struct job *j) {
     if (j->cmd_count == 0) {
         return 0;
@@ -313,8 +374,7 @@ int execute(struct job *j) {
     if (builtin_id) {
         switch (builtin_id) {
         case 1:
-            // TODO: implement cd in the parent process.
-            return 0;
+            return run_cd(&j->cmds[0]);
         case 2:
             return 1;
         case 3:
@@ -370,6 +430,11 @@ int execute(struct job *j) {
 }
 
 int main() {
+    if (!init_shell_env()) {
+        print_execution_error();
+        return 1;
+    }
+
     while(1) {
         print_prompt();
         ssize_t input_len = getline(&input, &input_cap, stdin);
