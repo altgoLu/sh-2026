@@ -234,8 +234,139 @@ int parser(struct job *j) {
     return j->cmd_count > 0;
 }
 
-void execute(struct job *j) {
-    return;
+static int validate_execution_plan(struct job *j) {
+    for (int i = 0; i < j->cmd_count; i++) {
+        if (j->cmds[i].infile != NULL || j->cmds[i].append) {
+            return 0;
+        }
+        if (i < j->cmd_count - 1 && j->cmds[i].outfile != NULL) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int builtin_command_id(struct command *cmd) {
+    if (cmd->argc == 0) {
+        return 0;
+    }
+    if (strcmp(cmd->argv[0], "cd") == 0) {
+        return 1;
+    }
+    if (strcmp(cmd->argv[0], "exit") == 0) {
+        return 2;
+    }
+    if (strcmp(cmd->argv[0], "env-use") == 0) {
+        return 3;
+    }
+    if (strcmp(cmd->argv[0], "env-exit") == 0) {
+        return 4;
+    }
+    return 0;
+}
+
+static void close_all_pipes(int pipes[][2], int pipe_count) {
+    for (int i = 0; i < pipe_count; i++) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+}
+
+static int setup_child_io(struct job *j, int index, int pipes[][2]) {
+    struct command *cmd = &j->cmds[index];
+
+    if (index > 0 && dup2(pipes[index - 1][0], STDIN_FILENO) == -1) {
+        return 0;
+    }
+
+    if (cmd->outfile != NULL) {
+        int fd = open(cmd->outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd == -1) {
+            return 0;
+        }
+        if (dup2(fd, STDOUT_FILENO) == -1) {
+            close(fd);
+            return 0;
+        }
+        close(fd);
+    } else if (index < j->cmd_count - 1 && dup2(pipes[index][1], STDOUT_FILENO) == -1) {
+        return 0;
+    }
+
+    return 1;
+}
+
+int execute(struct job *j) {
+    if (j->cmd_count == 0) {
+        return 0;
+    }
+
+    if (!validate_execution_plan(j)) {
+        print_invalid_syntax();
+        return 0;
+    }
+
+    int builtin_id = 0;
+    if (j->cmd_count == 1) {
+        builtin_id = builtin_command_id(&j->cmds[0]);
+    }
+    if (builtin_id) {
+        switch (builtin_id) {
+        case 1:
+            // TODO: implement cd in the parent process.
+            return 0;
+        case 2:
+            return 1;
+        case 3:
+            // TODO: implement env-use in the parent process.
+            return 0;
+        case 4:
+            // TODO: implement env-exit in the parent process.
+            return 0;
+        }
+    }
+
+    int pipe_count = j->cmd_count - 1;
+    int pipes[MAX_CMDS - 1][2];
+    pid_t pids[MAX_CMDS];
+
+    for (int i = 0; i < pipe_count; i++) {
+        if (pipe(pipes[i]) == -1) {
+            close_all_pipes(pipes, i);
+            print_execution_error();
+            return 0;
+        }
+    }
+
+    for (int i = 0; i < j->cmd_count; i++) {
+        pids[i] = fork();
+        if (pids[i] == -1) {
+            close_all_pipes(pipes, pipe_count);
+            print_execution_error();
+            return 0;
+        }
+
+        if (pids[i] == 0) {
+            if (!setup_child_io(j, i, pipes)) {
+                _exit(1);
+            }
+            close_all_pipes(pipes, pipe_count);
+            // TODO: exec the command after stdin/stdout are connected.
+            _exit(0);
+        }
+    }
+
+    close_all_pipes(pipes, pipe_count);
+
+    if (j->background) {
+        return 0;
+    }
+
+    for (int i = 0; i < j->cmd_count; i++) {
+        waitpid(pids[i], NULL, 0);
+    }
+
+    return 0;
 }
 
 int main() {
@@ -254,7 +385,10 @@ int main() {
         if (!parser(&j)) {
             print_invalid_syntax();
         } else {
-            execute(&j);
+            if (execute(&j)) {
+                free_tokens();
+                break;
+            }
         }
 
 
