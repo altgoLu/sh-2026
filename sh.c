@@ -70,6 +70,7 @@ void print_blocked_syscall(char* syscall_name, int count, ...) {
 #define MAX_RULES 32
 #define MAX_RULE_ARGS 6
 #define MAX_RULE_STR 256
+#define MAX_TRACEES 128
 #define EXIT_CMD_NOT_FOUND 127
 #define EXIT_EXEC_ERROR 126
 
@@ -93,6 +94,7 @@ struct tracee_state {
     pid_t pid;
     int alive;
     int in_syscall;
+    int options_set;
 };
 
 struct token {
@@ -791,15 +793,46 @@ static int run_builtin(struct command *cmd, int in_parent) {
     }
 }
 
+static int find_tracee_index(struct tracee_state *tracees, int tracee_count, pid_t pid) {
+    for (int i = 0; i < tracee_count; i++) {
+        if (tracees[i].alive && tracees[i].pid == pid) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int add_tracee(struct tracee_state *tracees, int *tracee_count, pid_t pid) {
+    if (find_tracee_index(tracees, *tracee_count, pid) != -1) {
+        return 1;
+    }
+    if (*tracee_count >= MAX_TRACEES) {
+        return 0;
+    }
+
+    tracees[*tracee_count].pid = pid;
+    tracees[*tracee_count].alive = 1;
+    tracees[*tracee_count].in_syscall = 0;
+    tracees[*tracee_count].options_set = 0;
+    (*tracee_count)++;
+    return 1;
+}
+
 static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
-    struct tracee_state tracees[MAX_CMDS];
+    struct tracee_state tracees[MAX_TRACEES];
+    int tracee_count = 0;
     int remaining = pid_count;
     int blocked = 0;
+    long ptrace_options = PTRACE_O_TRACESYSGOOD |
+                          PTRACE_O_TRACEFORK |
+                          PTRACE_O_TRACEVFORK |
+                          PTRACE_O_TRACECLONE;
 
     for (int i = 0; i < pid_count; i++) {
-        tracees[i].pid = pids[i];
-        tracees[i].alive = 1;
-        tracees[i].in_syscall = 0;
+        if (!add_tracee(tracees, &tracee_count, pids[i])) {
+            print_execution_error();
+            return 0;
+        }
     }
 
     while (remaining > 0) {
@@ -814,14 +847,10 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            int index = -1;
-            for (int i = 0; i < pid_count; i++) {
-                if (tracees[i].alive && tracees[i].pid == pid) {
-                    tracees[i].alive = 0;
-                    index = i;
-                    remaining--;
-                    break;
-                }
+            int index = find_tracee_index(tracees, tracee_count, pid);
+            if (index != -1) {
+                tracees[index].alive = 0;
+                remaining--;
             }
             if (blocked) {
                 continue;
@@ -835,19 +864,32 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
         }
 
         if (WIFSTOPPED(status)) {
-            int index = -1;
-            for (int i = 0; i < pid_count; i++) {
-                if (tracees[i].alive && tracees[i].pid == pid) {
-                    index = i;
-                    break;
-                }
-            }
+            int index = find_tracee_index(tracees, tracee_count, pid);
             if (index == -1) {
                 continue;
             }
 
-            if (!tracees[index].in_syscall) {
-                if (ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)PTRACE_O_TRACESYSGOOD) == -1 && errno != ESRCH) {
+            if (!tracees[index].options_set) {
+                if (ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)ptrace_options) == -1 && errno != ESRCH) {
+                    print_execution_error();
+                    return 0;
+                }
+                tracees[index].options_set = 1;
+            }
+
+            unsigned int event = (unsigned int)status >> 16;
+            if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
+                unsigned long new_pid = 0;
+                if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &new_pid) == -1) {
+                    print_execution_error();
+                    return 0;
+                }
+                if (!add_tracee(tracees, &tracee_count, (pid_t)new_pid)) {
+                    print_execution_error();
+                    return 0;
+                }
+                remaining++;
+                if (!blocked && ptrace(PTRACE_SYSCALL, (pid_t)new_pid, NULL, NULL) == -1 && errno != ESRCH) {
                     print_execution_error();
                     return 0;
                 }
@@ -863,7 +905,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                     if (!blocked && syscall_matches_deny_list(pid, &regs) != -1) {
                         print_blocked_syscall_from_regs(pid, &regs);
                         blocked = 1;
-                        for (int i = 0; i < pid_count; i++) {
+                        for (int i = 0; i < tracee_count; i++) {
                             if (tracees[i].alive) {
                                 kill(tracees[i].pid, SIGKILL);
                             }
