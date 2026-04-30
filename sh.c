@@ -88,8 +88,7 @@ struct token {
         PIPE,
         REDIRECT_IN,
         REDIRECT_OUT,
-        REDIRECT_APPEND,
-        BACKGROUND
+        REDIRECT_APPEND
     } type;
     char *value;
 } tokens[MAX_TOKENS];
@@ -130,14 +129,10 @@ void tokenizer(char *line) {
             tokens[ntok].type = REDIRECT_IN;
             tokens[ntok].value = NULL;
             i++;
-        } else if(line[i] == '&') {
-            tokens[ntok].type = BACKGROUND;
-            tokens[ntok].value = NULL;
-            i++;
         } else {
             int j = i;
             while(j + 1 < len && !isspace(line[j + 1]) && line[j + 1] != '|' &&
-                line[j + 1] != '>' && line[j + 1] != '<' && line[j + 1] != '&') {
+                line[j + 1] != '>' && line[j + 1] != '<') {
                 j++;
             }
             tokens[ntok].type = WORD;
@@ -219,8 +214,6 @@ int parser(struct job *j) {
                 return 0;
             }
             break;
-        case BACKGROUND:
-            return 0;
         }
     }
 
