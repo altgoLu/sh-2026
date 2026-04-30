@@ -5,7 +5,6 @@ pipe [
     cmd2,
     cmd3
 ]
-background: 1 / 0
 
 cmd structure:
 {
@@ -28,9 +27,9 @@ execute(&j) 返回 int：
 - 0 表示继续 shell
 - 1 表示退出 shell
 
-先判断是否只有一个 cmd，如果是，再判断是否是：
-- cd/env-use/env-exit 在主进程修改状态，返回 0（这部分可以先写 TODO）
-- exit，返回 1
+先写一个统一的 builtin 执行函数，父进程和子进程都复用：
+- cd/env-use/env-exit 直接调用同样的逻辑
+- exit 在父进程里返回 1，在子进程里只退出当前子进程
 
 否则执行这样的流程：
 - 创建 n-1 个 pipe
@@ -40,10 +39,10 @@ execute(&j) 返回 int：
     - 如果 i < n - 1，stdout 接 pipes[i][1]
     - 如果 i = n - 1 且 stdout 是默认，则 stdout 接终端
     - 关闭所有 pipe 的 fd
-    - exec（这部分可以先写 TODO）
+    - 先判断当前 cmd 是否是 builtin
+        - 如果是 builtin，就直接在子进程里执行，然后退出
+        - 如果不是 builtin，再 exec
 - 主进程 fork 完，关闭所有 pipe（这一步和上一步是并行的）
-- 如果没有 &，那么 wait
-- 如果有，不阻塞
 
 cd 已经实现
 
@@ -56,3 +55,19 @@ cd 已经实现
     - 1，则是 command not found
     - 2, 则是 execution error
 - 如果不是正常退出，也是 Execution Error
+
+env-use / env-exit 实现流程：
+不用管env_path，他的框架代码全都不动。
+- env-use
+    - 检查 argc == 2
+    - 如果 env_active == 0，original_path = strdup(getenv("PATH"))
+    - new_path = argv[1] + "/bin:" + original_path
+    - setenv("PATH", new_path, 1)
+    - free(new_path)
+    - env_active = 1
+- env-exit
+    - 如果未激活则直接返回
+    - setenv("PATH", original_path, 1)
+    - free(original_path)
+    - original_path = NULL
+    - env_active = 0

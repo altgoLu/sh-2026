@@ -440,6 +440,21 @@ static int run_env_exit(void) {
     return 0;
 }
 
+static int run_builtin(struct command *cmd, int in_parent) {
+    switch (builtin_command_id(cmd)) {
+    case 1:
+        return run_cd(cmd);
+    case 2:
+        return in_parent ? 1 : 0;
+    case 3:
+        return run_env_use(cmd);
+    case 4:
+        return run_env_exit();
+    default:
+        return -1;
+    }
+}
+
 int execute(struct job *j) {
     if (j->cmd_count == 0) {
         return 0;
@@ -450,20 +465,10 @@ int execute(struct job *j) {
         return 0;
     }
 
-    int builtin_id = 0;
     if (j->cmd_count == 1) {
-        builtin_id = builtin_command_id(&j->cmds[0]);
-    }
-    if (builtin_id) {
-        switch (builtin_id) {
-        case 1:
-            return run_cd(&j->cmds[0]);
-        case 2:
-            return 1;
-        case 3:
-            return run_env_use(&j->cmds[0]);
-        case 4:
-            return run_env_exit();
+        int builtin_result = run_builtin(&j->cmds[0], 1);
+        if (builtin_result != -1) {
+            return builtin_result;
         }
     }
 
@@ -492,6 +497,10 @@ int execute(struct job *j) {
                 _exit(EXIT_EXEC_ERROR);
             }
             close_all_pipes(pipes, pipe_count);
+            int builtin_result = run_builtin(&j->cmds[i], 0);
+            if (builtin_result != -1) {
+                _exit(builtin_result == 0 ? 0 : EXIT_EXEC_ERROR);
+            }
             run_external_command(&j->cmds[i]);
         }
     }
