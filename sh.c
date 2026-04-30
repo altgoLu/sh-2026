@@ -89,6 +89,12 @@ struct job {
     int cmd_count;
 };
 
+struct tracee_state {
+    pid_t pid;
+    int alive;
+    int in_syscall;
+};
+
 struct token {
     enum token_type {
         WORD,
@@ -786,14 +792,14 @@ static int run_builtin(struct command *cmd, int in_parent) {
 }
 
 static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
-    int alive[MAX_CMDS];
-    int in_syscall[MAX_CMDS];
+    struct tracee_state tracees[MAX_CMDS];
     int remaining = pid_count;
     int blocked = 0;
 
     for (int i = 0; i < pid_count; i++) {
-        alive[i] = 1;
-        in_syscall[i] = 0;
+        tracees[i].pid = pids[i];
+        tracees[i].alive = 1;
+        tracees[i].in_syscall = 0;
     }
 
     while (remaining > 0) {
@@ -810,8 +816,8 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             int index = -1;
             for (int i = 0; i < pid_count; i++) {
-                if (alive[i] && pids[i] == pid) {
-                    alive[i] = 0;
+                if (tracees[i].alive && tracees[i].pid == pid) {
+                    tracees[i].alive = 0;
                     index = i;
                     remaining--;
                     break;
@@ -831,7 +837,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
         if (WIFSTOPPED(status)) {
             int index = -1;
             for (int i = 0; i < pid_count; i++) {
-                if (alive[i] && pids[i] == pid) {
+                if (tracees[i].alive && tracees[i].pid == pid) {
                     index = i;
                     break;
                 }
@@ -840,7 +846,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                 continue;
             }
 
-            if (!in_syscall[index]) {
+            if (!tracees[index].in_syscall) {
                 if (ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)PTRACE_O_TRACESYSGOOD) == -1 && errno != ESRCH) {
                     print_execution_error();
                     return 0;
@@ -848,7 +854,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
             }
 
             if (WSTOPSIG(status) == (SIGTRAP | 0x80)) {
-                if (!in_syscall[index]) {
+                if (!tracees[index].in_syscall) {
                     struct user_regs_struct regs;
                     if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
                         print_execution_error();
@@ -858,13 +864,13 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                         print_blocked_syscall_from_regs(pid, &regs);
                         blocked = 1;
                         for (int i = 0; i < pid_count; i++) {
-                            if (alive[i]) {
-                                kill(pids[i], SIGKILL);
+                            if (tracees[i].alive) {
+                                kill(tracees[i].pid, SIGKILL);
                             }
                         }
                     }
                 }
-                in_syscall[index] = !in_syscall[index];
+                tracees[index].in_syscall = !tracees[index].in_syscall;
             }
 
             if (blocked) {
