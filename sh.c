@@ -80,7 +80,6 @@ struct command {
 struct job {
     struct command cmds[MAX_CMDS];
     int cmd_count;
-    int background;
 };
 
 struct token {
@@ -162,7 +161,6 @@ static void init_command(struct command *cmd) {
 
 static void init_job(struct job *j) {
     j->cmd_count = 0;
-    j->background = 0;
     for (int i = 0; i < MAX_CMDS; i++) {
         init_command(&j->cmds[i]);
     }
@@ -222,11 +220,7 @@ int parser(struct job *j) {
             }
             break;
         case BACKGROUND:
-            if (i != ntok - 1 || command_is_empty(&current) || j->background) {
-                return 0;
-            }
-            j->background = 1;
-            break;
+            return 0;
         }
     }
 
@@ -417,10 +411,6 @@ int execute(struct job *j) {
     }
 
     close_all_pipes(pipes, pipe_count);
-
-    if (j->background) {
-        return 0;
-    }
 
     for (int i = 0; i < j->cmd_count; i++) {
         waitpid(pids[i], NULL, 0);
