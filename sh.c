@@ -1,6 +1,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/ptrace.h>
+#include <sys/user.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -66,6 +67,9 @@ void print_blocked_syscall(char* syscall_name, int count, ...) {
 #define MAX_CMDS 16
 #define MAX_INPUT 1024
 #define MAX_TOKENS 128
+#define MAX_RULES 32
+#define MAX_RULE_ARGS 6
+#define MAX_RULE_STR 256
 #define EXIT_CMD_NOT_FOUND 127
 #define EXIT_EXEC_ERROR 126
 
@@ -96,6 +100,30 @@ struct token {
     char *value;
 } tokens[MAX_TOKENS];
 int ntok;
+
+enum deny_arg_type {
+    DENY_ARG_NONE,
+    DENY_ARG_INT,
+    DENY_ARG_STRING
+};
+
+struct deny_arg {
+    int specified;
+    enum deny_arg_type type;
+    unsigned long int_value;
+    char str_value[MAX_RULE_STR];
+};
+
+struct deny_rule {
+    int syscall_no;
+    char syscall_name[32];
+    struct deny_arg args[MAX_RULE_ARGS];
+};
+
+struct deny_list {
+    struct deny_rule rules[MAX_RULES];
+    int rule_num;
+} deny_list;
 
 void free_tokens() {
     for (int i = 0; i < ntok; i++) {
@@ -258,6 +286,308 @@ static int builtin_command_id(struct command *cmd) {
         return 4;
     }
     return 0;
+}
+
+static int sandbox_syscall_number(const char *name) {
+    if (strcmp(name, "read") == 0) return 0;
+    if (strcmp(name, "write") == 0) return 1;
+    if (strcmp(name, "open") == 0) return 2;
+    if (strcmp(name, "pipe") == 0) return 22;
+    if (strcmp(name, "dup") == 0) return 32;
+    if (strcmp(name, "clone") == 0) return 56;
+    if (strcmp(name, "fork") == 0) return 57;
+    if (strcmp(name, "execve") == 0 || strcmp(name, "execute") == 0) return 59;
+    if (strcmp(name, "mkdir") == 0) return 83;
+    if (strcmp(name, "chmod") == 0) return 90;
+    return -1;
+}
+
+static const char *sandbox_syscall_name(long syscall_no) {
+    switch (syscall_no) {
+    case 0: return "read";
+    case 1: return "write";
+    case 2: return "open";
+    case 22: return "pipe";
+    case 32: return "dup";
+    case 56: return "clone";
+    case 57: return "fork";
+    case 59: return "execve";
+    case 83: return "mkdir";
+    case 90: return "chmod";
+    default: return NULL;
+    }
+}
+
+static int sandbox_syscall_arg_count(long syscall_no) {
+    switch (syscall_no) {
+    case 0:
+    case 1:
+    case 2:
+    case 83:
+    case 90:
+        return 3;
+    case 22:
+    case 32:
+        return 1;
+    case 56:
+        return 5;
+    case 57:
+        return 0;
+    case 59:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+static unsigned long syscall_arg_value(const struct user_regs_struct *regs, int index) {
+    switch (index) {
+    case 0: return regs->rdi;
+    case 1: return regs->rsi;
+    case 2: return regs->rdx;
+    case 3: return regs->r10;
+    case 4: return regs->r8;
+    case 5: return regs->r9;
+    default: return 0;
+    }
+}
+
+static void trim_whitespace(char *s) {
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[--len] = '\0';
+    }
+
+    size_t start = 0;
+    while (s[start] != '\0' && isspace((unsigned char)s[start])) {
+        start++;
+    }
+    if (start > 0) {
+        memmove(s, s + start, strlen(s + start) + 1);
+    }
+}
+
+static void init_deny_list(void) {
+    deny_list.rule_num = 0;
+    for (int i = 0; i < MAX_RULES; i++) {
+        deny_list.rules[i].syscall_no = -1;
+        deny_list.rules[i].syscall_name[0] = '\0';
+        for (int j = 0; j < MAX_RULE_ARGS; j++) {
+            deny_list.rules[i].args[j].specified = 0;
+            deny_list.rules[i].args[j].type = DENY_ARG_NONE;
+            deny_list.rules[i].args[j].int_value = 0;
+            deny_list.rules[i].args[j].str_value[0] = '\0';
+        }
+    }
+}
+
+static int load_deny_rules(const char *rule_path) {
+    FILE *fp = fopen(rule_path, "r");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    init_deny_list();
+    char line[512];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *comment = strchr(line, '#');
+        if (comment != NULL) {
+            *comment = '\0';
+        }
+        trim_whitespace(line);
+        if (line[0] == '\0') {
+            continue;
+        }
+        if (strncmp(line, "deny:", 5) != 0 || deny_list.rule_num >= MAX_RULES) {
+            fclose(fp);
+            return 0;
+        }
+
+        struct deny_rule *rule = &deny_list.rules[deny_list.rule_num];
+        char *cursor = line + 5;
+        while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+
+        char *name = strtok(cursor, " \t");
+        if (name == NULL) {
+            fclose(fp);
+            return 0;
+        }
+
+        rule->syscall_no = sandbox_syscall_number(name);
+        if (rule->syscall_no == -1) {
+            fclose(fp);
+            return 0;
+        }
+        snprintf(rule->syscall_name, sizeof(rule->syscall_name), "%s", sandbox_syscall_name(rule->syscall_no));
+
+        char *token = NULL;
+        while ((token = strtok(NULL, " \t")) != NULL) {
+            if (strncmp(token, "arg", 3) != 0) {
+                fclose(fp);
+                return 0;
+            }
+
+            char *eq = strchr(token, '=');
+            if (eq == NULL) {
+                fclose(fp);
+                return 0;
+            }
+            *eq = '\0';
+
+            int arg_index = atoi(token + 3);
+            if (arg_index < 0 || arg_index >= MAX_RULE_ARGS) {
+                fclose(fp);
+                return 0;
+            }
+
+            struct deny_arg *arg = &rule->args[arg_index];
+            arg->specified = 1;
+            char *value = eq + 1;
+            size_t len = strlen(value);
+            if (len >= 2 && value[0] == '"' && value[len - 1] == '"') {
+                value[len - 1] = '\0';
+                arg->type = DENY_ARG_STRING;
+                snprintf(arg->str_value, sizeof(arg->str_value), "%s", value + 1);
+            } else {
+                arg->type = DENY_ARG_INT;
+                arg->int_value = strtoul(value, NULL, 0);
+            }
+        }
+
+        deny_list.rule_num++;
+    }
+
+    fclose(fp);
+    return 1;
+}
+
+static int read_tracee_string(pid_t pid, unsigned long addr, char *buf, size_t buf_size) {
+    if (buf_size == 0) {
+        return 0;
+    }
+    if (addr == 0) {
+        buf[0] = '\0';
+        return 1;
+    }
+
+    size_t offset = 0;
+    while (offset < buf_size - 1) {
+        errno = 0;
+        long word = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + offset), NULL);
+        if (word == -1 && errno != 0) {
+            return 0;
+        }
+
+        unsigned char *bytes = (unsigned char *)&word;
+        for (size_t i = 0; i < sizeof(long) && offset < buf_size - 1; i++) {
+            buf[offset++] = (char)bytes[i];
+            if (bytes[i] == '\0') {
+                return 1;
+            }
+        }
+    }
+
+    buf[buf_size - 1] = '\0';
+    return 1;
+}
+
+static int rule_matches(pid_t pid, const struct deny_rule *rule, const struct user_regs_struct *regs) {
+    if ((long)rule->syscall_no != (long)regs->orig_rax) {
+        return 0;
+    }
+
+    for (int i = 0; i < MAX_RULE_ARGS; i++) {
+        if (!rule->args[i].specified) {
+            continue;
+        }
+
+        unsigned long actual = syscall_arg_value(regs, i);
+        if (rule->args[i].type == DENY_ARG_INT) {
+            if (actual != rule->args[i].int_value) {
+                return 0;
+            }
+        } else if (rule->args[i].type == DENY_ARG_STRING) {
+            char value[MAX_RULE_STR];
+            if (!read_tracee_string(pid, actual, value, sizeof(value))) {
+                return 0;
+            }
+            if (strcmp(value, rule->args[i].str_value) != 0) {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+static int syscall_matches_deny_list(pid_t pid, const struct user_regs_struct *regs) {
+    for (int i = 0; i < deny_list.rule_num; i++) {
+        if (rule_matches(pid, &deny_list.rules[i], regs)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void format_blocked_arg(pid_t pid, long syscall_no, int arg_index, unsigned long value,
+                               char *buf, size_t buf_size) {
+    if ((syscall_no == 1 && arg_index == 1) ||
+        (syscall_no == 2 && arg_index == 0) ||
+        (syscall_no == 59 && arg_index == 0) ||
+        (syscall_no == 83 && arg_index == 0)) {
+        char str[MAX_RULE_STR];
+        if (read_tracee_string(pid, value, str, sizeof(str))) {
+            snprintf(buf, buf_size, "\"%s\"", str);
+            return;
+        }
+    }
+
+    if ((syscall_no == 0 && arg_index == 1) ||
+        (syscall_no == 22 && arg_index == 0) ||
+        (syscall_no == 59 && (arg_index == 1 || arg_index == 2))) {
+        snprintf(buf, buf_size, "@x%lx", value);
+        return;
+    }
+
+    snprintf(buf, buf_size, "%lu", value);
+}
+
+static void print_blocked_syscall_from_regs(pid_t pid, const struct user_regs_struct *regs) {
+    const char *syscall_name = sandbox_syscall_name((long)regs->orig_rax);
+    int arg_count = sandbox_syscall_arg_count((long)regs->orig_rax);
+    char args[MAX_RULE_ARGS][MAX_RULE_STR];
+    char *arg_ptrs[MAX_RULE_ARGS];
+
+    for (int i = 0; i < arg_count; i++) {
+        format_blocked_arg(pid, (long)regs->orig_rax, i, syscall_arg_value(regs, i), args[i], sizeof(args[i]));
+        arg_ptrs[i] = args[i];
+    }
+
+    switch (arg_count) {
+    case 0:
+        print_blocked_syscall((char *)syscall_name, 0);
+        break;
+    case 1:
+        print_blocked_syscall((char *)syscall_name, 1, arg_ptrs[0]);
+        break;
+    case 2:
+        print_blocked_syscall((char *)syscall_name, 2, arg_ptrs[0], arg_ptrs[1]);
+        break;
+    case 3:
+        print_blocked_syscall((char *)syscall_name, 3, arg_ptrs[0], arg_ptrs[1], arg_ptrs[2]);
+        break;
+    case 4:
+        print_blocked_syscall((char *)syscall_name, 4, arg_ptrs[0], arg_ptrs[1], arg_ptrs[2], arg_ptrs[3]);
+        break;
+    case 5:
+        print_blocked_syscall((char *)syscall_name, 5, arg_ptrs[0], arg_ptrs[1], arg_ptrs[2], arg_ptrs[3], arg_ptrs[4]);
+        break;
+    case 6:
+        print_blocked_syscall((char *)syscall_name, 6, arg_ptrs[0], arg_ptrs[1], arg_ptrs[2], arg_ptrs[3], arg_ptrs[4], arg_ptrs[5]);
+        break;
+    }
 }
 
 static void close_all_pipes(int pipes[][2], int pipe_count) {
@@ -455,7 +785,104 @@ static int run_builtin(struct command *cmd, int in_parent) {
     }
 }
 
-int execute(struct job *j) {
+static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
+    int alive[MAX_CMDS];
+    int in_syscall[MAX_CMDS];
+    int remaining = pid_count;
+    int blocked = 0;
+
+    for (int i = 0; i < pid_count; i++) {
+        alive[i] = 1;
+        in_syscall[i] = 0;
+    }
+
+    while (remaining > 0) {
+        int status = 0;
+        pid_t pid = waitpid(-1, &status, __WALL);
+        if (pid == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            print_execution_error();
+            return 0;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            int index = -1;
+            for (int i = 0; i < pid_count; i++) {
+                if (alive[i] && pids[i] == pid) {
+                    alive[i] = 0;
+                    index = i;
+                    remaining--;
+                    break;
+                }
+            }
+            if (blocked) {
+                continue;
+            }
+            if (WIFEXITED(status)) {
+                handle_child_status(status);
+            } else {
+                print_execution_error();
+            }
+            continue;
+        }
+
+        if (WIFSTOPPED(status)) {
+            int index = -1;
+            for (int i = 0; i < pid_count; i++) {
+                if (alive[i] && pids[i] == pid) {
+                    index = i;
+                    break;
+                }
+            }
+            if (index == -1) {
+                continue;
+            }
+
+            if (!in_syscall[index]) {
+                if (ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)PTRACE_O_TRACESYSGOOD) == -1 && errno != ESRCH) {
+                    print_execution_error();
+                    return 0;
+                }
+            }
+
+            if (WSTOPSIG(status) == (SIGTRAP | 0x80)) {
+                if (!in_syscall[index]) {
+                    struct user_regs_struct regs;
+                    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
+                        print_execution_error();
+                        return 0;
+                    }
+                    if (!blocked && syscall_matches_deny_list(pid, &regs) != -1) {
+                        print_blocked_syscall_from_regs(pid, &regs);
+                        blocked = 1;
+                        for (int i = 0; i < pid_count; i++) {
+                            if (alive[i]) {
+                                kill(pids[i], SIGKILL);
+                            }
+                        }
+                    }
+                }
+                in_syscall[index] = !in_syscall[index];
+            }
+
+            if (blocked) {
+                continue;
+            }
+
+            if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) == -1 && errno != ESRCH) {
+                print_execution_error();
+                return 0;
+            }
+        }
+    }
+
+    return 0;
+}
+
+int execute(struct job *j, int sandbox_enabled, const char *rule_path) {
+    (void)rule_path;
     if (j->cmd_count == 0) {
         return 0;
     }
@@ -493,6 +920,12 @@ int execute(struct job *j) {
         }
 
         if (pids[i] == 0) {
+            if (sandbox_enabled) {
+                if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+                    _exit(EXIT_EXEC_ERROR);
+                }
+                raise(SIGSTOP);
+            }
             if (!setup_child_io(j, i, pipes)) {
                 _exit(EXIT_EXEC_ERROR);
             }
@@ -506,6 +939,10 @@ int execute(struct job *j) {
     }
 
     close_all_pipes(pipes, pipe_count);
+
+    if (sandbox_enabled) {
+        return wait_for_sandbox_children(pids, j->cmd_count);
+    }
 
     for (int i = 0; i < j->cmd_count; i++) {
         int status = 0;
@@ -525,6 +962,8 @@ int main() {
         return 1;
     }
 
+    init_deny_list();
+
     while(1) {
         print_prompt();
         ssize_t input_len = getline(&input, &input_cap, stdin);
@@ -536,11 +975,33 @@ int main() {
             continue;
         }
         tokenizer(input);
+        int sandbox_enabled = 0;
+        char *sandbox_rule_path = NULL;
+        if (ntok >= 1 && tokens[0].type == WORD && strcmp(tokens[0].value, "sandbox") == 0) {
+            if (ntok < 3 || tokens[1].type != WORD) {
+                print_invalid_syntax();
+                free_tokens();
+                continue;
+            }
+            sandbox_enabled = 1;
+            sandbox_rule_path = tokens[1].value;
+            if (!load_deny_rules(sandbox_rule_path)) {
+                print_execution_error();
+                free_tokens();
+                continue;
+            }
+            for (int i = 2; i < ntok; i++) {
+                tokens[i - 2] = tokens[i];
+            }
+            ntok -= 2;
+        } else {
+            init_deny_list();
+        }
         struct job j;
         if (!parser(&j)) {
             print_invalid_syntax();
         } else {
-            if (execute(&j)) {
+            if (execute(&j, sandbox_enabled, sandbox_rule_path)) {
                 free_tokens();
                 break;
             }
