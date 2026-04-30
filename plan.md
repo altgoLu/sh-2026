@@ -18,7 +18,7 @@ cmd structure:
 ```
 
 解析指令：
-cat a.txt | grep "abc" &
+cat a.txt | grep abc
 
 执行流程：
 
@@ -48,6 +48,11 @@ execute(&j) 返回 int：
 cd 已经实现
 
 实现外部命令：
-- 进入 ???_command 函数
-- fork 自己
-- execvp 执行 argv[0] 的命令
+- execvp 执行 argv[0] 的命令，然后把 argv 传作参数
+- 根据返回值
+    - 如果 errno == ENOENT，则 _exit(1)
+    - 如果是其它错误，则 _exit(2)
+- 如果父进程 waitpid 到了（经过WIFEXITED）
+    - 1，则是 command not found
+    - 2, 则是 execution error
+- 如果不是正常退出，也是 Execution Error
