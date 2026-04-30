@@ -343,6 +343,7 @@ static int run_cd(struct command *cmd) {
     }
 
     char oldpwd[PATH_MAX];
+    char expanded_target[PATH_MAX];
     if (getcwd(oldpwd, sizeof(oldpwd)) == NULL) {
         print_execution_error();
         return 0;
@@ -351,6 +352,17 @@ static int run_cd(struct command *cmd) {
     char *target = cmd->argv[1];
     if (strcmp(target, "~") == 0) {
         target = getenv("HOME");
+    } else if (strncmp(target, "~/", 2) == 0) {
+        char *home = getenv("HOME");
+        if (home == NULL) {
+            print_execution_error();
+            return 0;
+        }
+        if (snprintf(expanded_target, sizeof(expanded_target), "%s/%s", home, target + 2) >= (int)sizeof(expanded_target)) {
+            print_execution_error();
+            return 0;
+        }
+        target = expanded_target;
     } else if (strcmp(target, "-") == 0) {
         target = getenv("OLDPWD");
     }
@@ -370,6 +382,61 @@ static int run_cd(struct command *cmd) {
         print_execution_error();
     }
 
+    return 0;
+}
+
+static int run_env_use(struct command *cmd) {
+    if (cmd->argc != 2) {
+        print_invalid_syntax();
+        return 0;
+    }
+
+    if (!env_active) {
+        char *path = getenv("PATH");
+        if (path == NULL) {
+            print_execution_error();
+            return 0;
+        }
+
+        original_path = strdup(path);
+        if (original_path == NULL) {
+            print_execution_error();
+            return 0;
+        }
+    }
+
+    size_t new_path_len = strlen(cmd->argv[1]) + strlen("/bin:") + strlen(original_path) + 1;
+    char *new_path = malloc(new_path_len);
+    if (new_path == NULL) {
+        print_execution_error();
+        return 0;
+    }
+
+    snprintf(new_path, new_path_len, "%s/bin:%s", cmd->argv[1], original_path);
+    if (setenv("PATH", new_path, 1) != 0) {
+        free(new_path);
+        print_execution_error();
+        return 0;
+    }
+
+    free(new_path);
+    env_active = 1;
+    return 0;
+}
+
+static int run_env_exit(void) {
+    if (!env_active) {
+        return 0;
+    }
+
+    if (original_path == NULL || setenv("PATH", original_path, 1) != 0) {
+        print_execution_error();
+        return 0;
+    }
+
+    free(original_path);
+    original_path = NULL;
+    env_active = 0;
     return 0;
 }
 
@@ -394,11 +461,9 @@ int execute(struct job *j) {
         case 2:
             return 1;
         case 3:
-            // TODO: implement env-use in the parent process.
-            return 0;
+            return run_env_use(&j->cmds[0]);
         case 4:
-            // TODO: implement env-exit in the parent process.
-            return 0;
+            return run_env_exit();
         }
     }
 
