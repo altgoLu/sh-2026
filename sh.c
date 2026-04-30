@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -65,6 +66,8 @@ void print_blocked_syscall(char* syscall_name, int count, ...) {
 #define MAX_CMDS 16
 #define MAX_INPUT 1024
 #define MAX_TOKENS 128
+#define EXIT_CMD_NOT_FOUND 127
+#define EXIT_EXEC_ERROR 126
 
 char *input = NULL;
 size_t input_cap = 0;
@@ -288,6 +291,32 @@ static int setup_child_io(struct job *j, int index, int pipes[][2]) {
     return 1;
 }
 
+static void run_external_command(struct command *cmd) {
+    execvp(cmd->argv[0], cmd->argv);
+
+    if (errno == ENOENT) {
+        _exit(EXIT_CMD_NOT_FOUND);
+    }
+    _exit(EXIT_EXEC_ERROR);
+}
+
+static void handle_child_status(int status) {
+    if (!WIFEXITED(status)) {
+        print_execution_error();
+        return;
+    }
+
+    int code = WEXITSTATUS(status);
+    if (code == 0) {
+        return;
+    }
+    if (code == EXIT_CMD_NOT_FOUND) {
+        print_command_not_found();
+        return;
+    }
+    print_execution_error();
+}
+
 static int init_shell_env(void) {
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
@@ -395,18 +424,22 @@ int execute(struct job *j) {
 
         if (pids[i] == 0) {
             if (!setup_child_io(j, i, pipes)) {
-                _exit(1);
+                _exit(EXIT_EXEC_ERROR);
             }
             close_all_pipes(pipes, pipe_count);
-            // TODO: exec the command after stdin/stdout are connected.
-            _exit(0);
+            run_external_command(&j->cmds[i]);
         }
     }
 
     close_all_pipes(pipes, pipe_count);
 
     for (int i = 0; i < j->cmd_count; i++) {
-        waitpid(pids[i], NULL, 0);
+        int status = 0;
+        if (waitpid(pids[i], &status, 0) == -1) {
+            print_execution_error();
+            continue;
+        }
+        handle_child_status(status);
     }
 
     return 0;
