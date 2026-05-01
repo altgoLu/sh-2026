@@ -70,6 +70,7 @@ void print_blocked_syscall(char* syscall_name, int count, ...) {
 #define MAX_RULES 32
 #define MAX_RULE_ARGS 6
 #define MAX_RULE_STR 256
+#define MAX_DISPLAY_STR 1024
 #define MAX_TRACEES 128
 #define EXIT_CMD_NOT_FOUND 127
 #define EXIT_EXEC_ERROR 126
@@ -143,44 +144,99 @@ void free_tokens() {
     ntok = 0;
 }
 
-void tokenizer(char *line) {
-    int len = strlen(line); ntok = 0;
-    for(int i = 0; i < len;) {
-        if(isspace(line[i])) {
+static int push_token(enum token_type type, const char *value) {
+    if (ntok >= MAX_TOKENS) {
+        return 0;
+    }
+
+    tokens[ntok].type = type;
+    tokens[ntok].value = NULL;
+    if (type == WORD) {
+        tokens[ntok].value = strdup(value);
+        if (tokens[ntok].value == NULL) {
+            return 0;
+        }
+    }
+    ntok++;
+    return 1;
+}
+
+int tokenizer(char *line) {
+    int len = strlen(line);
+    ntok = 0;
+    for (int i = 0; i < len;) {
+        if (isspace((unsigned char)line[i])) {
             i++;
             continue;
         }
-        if(line[i] == '|') {
-            tokens[ntok].type = PIPE;
-            tokens[ntok].value = NULL;
+
+        if (line[i] == '|') {
+            if (!push_token(PIPE, NULL)) {
+                free_tokens();
+                return 0;
+            }
             i++;
-        } else if(line[i] == '>') {
-            if(i + 1 < len && line[i + 1] == '>') {
-                tokens[ntok].type = REDIRECT_APPEND;
-                tokens[ntok].value = NULL;
+        } else if (line[i] == '>') {
+            if (i + 1 < len && line[i + 1] == '>') {
+                if (!push_token(REDIRECT_APPEND, NULL)) {
+                    free_tokens();
+                    return 0;
+                }
                 i += 2;
             } else {
-                tokens[ntok].type = REDIRECT_OUT;
-                tokens[ntok].value = NULL;
+                if (!push_token(REDIRECT_OUT, NULL)) {
+                    free_tokens();
+                    return 0;
+                }
                 i++;
             }
-        } else if(line[i] == '<') {
-            tokens[ntok].type = REDIRECT_IN;
-            tokens[ntok].value = NULL;
+        } else if (line[i] == '<') {
+            if (!push_token(REDIRECT_IN, NULL)) {
+                free_tokens();
+                return 0;
+            }
             i++;
         } else {
-            int j = i;
-            while(j + 1 < len && !isspace(line[j + 1]) && line[j + 1] != '|' &&
-                line[j + 1] != '>' && line[j + 1] != '<') {
-                j++;
+            char word[MAX_INPUT];
+            int word_len = 0;
+
+            while (i < len &&
+                   !isspace((unsigned char)line[i]) &&
+                   line[i] != '|' &&
+                   line[i] != '>' &&
+                   line[i] != '<') {
+                if (line[i] == '\'' || line[i] == '"') {
+                    char quote = line[i++];
+                    while (i < len && line[i] != quote) {
+                        if (word_len >= MAX_INPUT - 1) {
+                            free_tokens();
+                            return 0;
+                        }
+                        word[word_len++] = line[i++];
+                    }
+                    if (i >= len) {
+                        free_tokens();
+                        return 0;
+                    }
+                    i++;
+                } else {
+                    if (word_len >= MAX_INPUT - 1) {
+                        free_tokens();
+                        return 0;
+                    }
+                    word[word_len++] = line[i++];
+                }
             }
-            tokens[ntok].type = WORD;
-            tokens[ntok].value = strndup(line + i, j - i + 1);
-            i = j + 1;
+
+            word[word_len] = '\0';
+            if (!push_token(WORD, word)) {
+                free_tokens();
+                return 0;
+            }
         }
-        ntok++;
     }
-    return;
+
+    return 1;
 }
 
 static void init_command(struct command *cmd) {
@@ -389,6 +445,27 @@ static void init_deny_list(void) {
     }
 }
 
+static int parse_rule_string_value(char **cursor, char *buf, size_t buf_size) {
+    size_t len = 0;
+
+    (*cursor)++;
+    while (**cursor != '\0' && **cursor != '"') {
+        if (len >= buf_size - 1) {
+            return 0;
+        }
+        buf[len++] = **cursor;
+        (*cursor)++;
+    }
+
+    if (**cursor != '"') {
+        return 0;
+    }
+
+    buf[len] = '\0';
+    (*cursor)++;
+    return 1;
+}
+
 static int load_deny_rules(const char *rule_path) {
     FILE *fp = fopen(rule_path, "r");
     if (fp == NULL) {
@@ -417,34 +494,53 @@ static int load_deny_rules(const char *rule_path) {
             cursor++;
         }
 
-        char *name = strtok(cursor, " \t");
-        if (name == NULL) {
+        char *name_start = cursor;
+        while (*cursor != '\0' && !isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (cursor == name_start) {
             fclose(fp);
             return 0;
         }
 
-        rule->syscall_no = sandbox_syscall_number(name);
+        char saved_name = *cursor;
+        *cursor = '\0';
+
+        rule->syscall_no = sandbox_syscall_number(name_start);
         if (rule->syscall_no == -1) {
+            *cursor = saved_name;
             fclose(fp);
             return 0;
         }
         snprintf(rule->syscall_name, sizeof(rule->syscall_name), "%s", sandbox_syscall_name(rule->syscall_no));
+        *cursor = saved_name;
 
-        char *token = NULL;
-        while ((token = strtok(NULL, " \t")) != NULL) {
-            if (strncmp(token, "arg", 3) != 0) {
+        while (*cursor != '\0') {
+            while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            if (*cursor == '\0') {
+                break;
+            }
+            if (strncmp(cursor, "arg", 3) != 0) {
                 fclose(fp);
                 return 0;
             }
 
-            char *eq = strchr(token, '=');
-            if (eq == NULL) {
+            cursor += 3;
+            char *index_start = cursor;
+            while (*cursor != '\0' && isdigit((unsigned char)*cursor)) {
+                cursor++;
+            }
+            if (cursor == index_start || *cursor != '=') {
                 fclose(fp);
                 return 0;
             }
-            *eq = '\0';
 
-            int arg_index = atoi(token + 3);
+            char saved = *cursor;
+            *cursor = '\0';
+            int arg_index = atoi(index_start);
+            *cursor = saved;
             if (arg_index < 0 || arg_index >= MAX_RULE_ARGS) {
                 fclose(fp);
                 return 0;
@@ -452,15 +548,29 @@ static int load_deny_rules(const char *rule_path) {
 
             struct deny_arg *arg = &rule->args[arg_index];
             arg->specified = 1;
-            char *value = eq + 1;
-            size_t len = strlen(value);
-            if (len >= 2 && value[0] == '"' && value[len - 1] == '"') {
-                value[len - 1] = '\0';
+            cursor++;
+
+            if (*cursor == '"') {
                 arg->type = DENY_ARG_STRING;
-                snprintf(arg->str_value, sizeof(arg->str_value), "%s", value + 1);
+                if (!parse_rule_string_value(&cursor, arg->str_value, sizeof(arg->str_value))) {
+                    fclose(fp);
+                    return 0;
+                }
             } else {
+                char *value_start = cursor;
+                while (*cursor != '\0' && !isspace((unsigned char)*cursor)) {
+                    cursor++;
+                }
+                if (cursor == value_start) {
+                    fclose(fp);
+                    return 0;
+                }
+
+                char saved_value = *cursor;
+                *cursor = '\0';
                 arg->type = DENY_ARG_INT;
-                arg->int_value = strtoul(value, NULL, 0);
+                arg->int_value = strtoul(value_start, NULL, 0);
+                *cursor = saved_value;
             }
         }
 
@@ -501,6 +611,86 @@ static int read_tracee_string(pid_t pid, unsigned long addr, char *buf, size_t b
     return 1;
 }
 
+static int read_tracee_bytes(pid_t pid, unsigned long addr, unsigned char *buf, size_t byte_count) {
+    size_t offset = 0;
+
+    while (offset < byte_count) {
+        errno = 0;
+        long word = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + offset), NULL);
+        if (word == -1 && errno != 0) {
+            return 0;
+        }
+
+        unsigned char *bytes = (unsigned char *)&word;
+        size_t chunk = sizeof(long);
+        if (chunk > byte_count - offset) {
+            chunk = byte_count - offset;
+        }
+        memcpy(buf + offset, bytes, chunk);
+        offset += chunk;
+    }
+
+    return 1;
+}
+
+static void format_escaped_string(const unsigned char *src, size_t src_len, char *buf, size_t buf_size) {
+    static const char hex_chars[] = "0123456789abcdef";
+    size_t out = 0;
+
+    if (buf_size == 0) {
+        return;
+    }
+
+    buf[out++] = '"';
+    for (size_t i = 0; i < src_len && out + 1 < buf_size; i++) {
+        unsigned char c = src[i];
+        const char *escape = NULL;
+
+        switch (c) {
+        case '\\':
+            escape = "\\\\";
+            break;
+        case '"':
+            escape = "\\\"";
+            break;
+        case '\n':
+            escape = "\\n";
+            break;
+        case '\r':
+            escape = "\\r";
+            break;
+        case '\t':
+            escape = "\\t";
+            break;
+        default:
+            break;
+        }
+
+        if (escape != NULL) {
+            for (int j = 0; escape[j] != '\0' && out + 1 < buf_size; j++) {
+                buf[out++] = escape[j];
+            }
+        } else if (isprint(c)) {
+            buf[out++] = (char)c;
+        } else if (out + 4 < buf_size) {
+            buf[out++] = '\\';
+            buf[out++] = 'x';
+            buf[out++] = hex_chars[(c >> 4) & 0xf];
+            buf[out++] = hex_chars[c & 0xf];
+        } else {
+            break;
+        }
+    }
+
+    if (out + 1 < buf_size) {
+        buf[out++] = '"';
+    } else if (buf_size >= 2) {
+        out = buf_size - 2;
+        buf[out++] = '"';
+    }
+    buf[out] = '\0';
+}
+
 static int rule_matches(pid_t pid, const struct deny_rule *rule, const struct user_regs_struct *regs) {
     if ((long)rule->syscall_no != (long)regs->orig_rax) {
         return 0;
@@ -517,12 +707,28 @@ static int rule_matches(pid_t pid, const struct deny_rule *rule, const struct us
                 return 0;
             }
         } else if (rule->args[i].type == DENY_ARG_STRING) {
-            char value[MAX_RULE_STR];
-            if (!read_tracee_string(pid, actual, value, sizeof(value))) {
-                return 0;
-            }
-            if (strcmp(value, rule->args[i].str_value) != 0) {
-                return 0;
+            if ((long)regs->orig_rax == 1 && i == 1) {
+                size_t expected_len = strlen(rule->args[i].str_value);
+                unsigned long actual_len = syscall_arg_value(regs, 2);
+                unsigned char value[MAX_RULE_STR];
+
+                if (actual_len != expected_len || expected_len >= sizeof(value)) {
+                    return 0;
+                }
+                if (!read_tracee_bytes(pid, actual, value, expected_len)) {
+                    return 0;
+                }
+                if (memcmp(value, rule->args[i].str_value, expected_len) != 0) {
+                    return 0;
+                }
+            } else {
+                char value[MAX_RULE_STR];
+                if (!read_tracee_string(pid, actual, value, sizeof(value))) {
+                    return 0;
+                }
+                if (strcmp(value, rule->args[i].str_value) != 0) {
+                    return 0;
+                }
             }
         }
     }
@@ -541,13 +747,27 @@ static int syscall_matches_deny_list(pid_t pid, const struct user_regs_struct *r
 
 static void format_blocked_arg(pid_t pid, long syscall_no, int arg_index, unsigned long value,
                                char *buf, size_t buf_size) {
-    if ((syscall_no == 1 && arg_index == 1) ||
-        (syscall_no == 2 && arg_index == 0) ||
+    if (syscall_no == 1 && arg_index == 1) {
+        struct user_regs_struct regs;
+        if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == 0) {
+            size_t byte_count = (size_t)regs.rdx;
+            unsigned char raw[MAX_DISPLAY_STR];
+            if (byte_count >= sizeof(raw)) {
+                byte_count = sizeof(raw) - 1;
+            }
+            if (read_tracee_bytes(pid, value, raw, byte_count)) {
+                format_escaped_string(raw, byte_count, buf, buf_size);
+                return;
+            }
+        }
+    }
+
+    if ((syscall_no == 2 && arg_index == 0) ||
         (syscall_no == 59 && arg_index == 0) ||
         (syscall_no == 83 && arg_index == 0)) {
         char str[MAX_RULE_STR];
         if (read_tracee_string(pid, value, str, sizeof(str))) {
-            snprintf(buf, buf_size, "\"%s\"", str);
+            format_escaped_string((unsigned char *)str, strlen(str), buf, buf_size);
             return;
         }
     }
@@ -565,7 +785,7 @@ static void format_blocked_arg(pid_t pid, long syscall_no, int arg_index, unsign
 static void print_blocked_syscall_from_regs(pid_t pid, const struct user_regs_struct *regs) {
     const char *syscall_name = sandbox_syscall_name((long)regs->orig_rax);
     int arg_count = sandbox_syscall_arg_count((long)regs->orig_rax);
-    char args[MAX_RULE_ARGS][MAX_RULE_STR];
+    char args[MAX_RULE_ARGS][MAX_DISPLAY_STR];
     char *arg_ptrs[MAX_RULE_ARGS];
 
     for (int i = 0; i < arg_count; i++) {
@@ -1022,7 +1242,10 @@ int main() {
             print_invalid_syntax();
             continue;
         }
-        tokenizer(input);
+        if (!tokenizer(input)) {
+            print_invalid_syntax();
+            continue;
+        }
         int sandbox_enabled = 0;
         char *sandbox_rule_path = NULL;
         if (ntok >= 1 && tokens[0].type == WORD && strcmp(tokens[0].value, "sandbox") == 0) {
