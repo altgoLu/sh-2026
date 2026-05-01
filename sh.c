@@ -633,6 +633,79 @@ static int read_tracee_bytes(pid_t pid, unsigned long addr, unsigned char *buf, 
     return 1;
 }
 
+static int read_tracee_cwd(pid_t pid, char *buf, size_t buf_size) {
+    char proc_path[64];
+    ssize_t len;
+
+    if (snprintf(proc_path, sizeof(proc_path), "/proc/%d/cwd", pid) >= (int)sizeof(proc_path)) {
+        return 0;
+    }
+
+    len = readlink(proc_path, buf, buf_size - 1);
+    if (len == -1 || len >= (ssize_t)(buf_size - 1)) {
+        return 0;
+    }
+
+    buf[len] = '\0';
+    return 1;
+}
+
+static int resolve_path_for_pid(pid_t pid, const char *path, char *resolved, size_t resolved_size) {
+    char cwd[PATH_MAX];
+    char candidate[PATH_MAX];
+
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+
+    if (path[0] == '/') {
+        if (snprintf(candidate, sizeof(candidate), "%s", path) >= (int)sizeof(candidate)) {
+            return 0;
+        }
+    } else {
+        if (!read_tracee_cwd(pid, cwd, sizeof(cwd))) {
+            return 0;
+        }
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", cwd, path) >= (int)sizeof(candidate)) {
+            return 0;
+        }
+    }
+
+    return realpath(candidate, resolved) != NULL;
+}
+
+static int path_strings_match(pid_t pid, const char *expected, const char *actual) {
+    if (strcmp(expected, actual) == 0) {
+        return 1;
+    }
+
+    char resolved_expected[PATH_MAX];
+    char resolved_actual[PATH_MAX];
+    if (resolve_path_for_pid(pid, expected, resolved_expected, sizeof(resolved_expected)) &&
+        resolve_path_for_pid(pid, actual, resolved_actual, sizeof(resolved_actual)) &&
+        strcmp(resolved_expected, resolved_actual) == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int execve_path_matches(pid_t pid, const char *expected, const char *actual) {
+    if (path_strings_match(pid, expected, actual)) {
+        return 1;
+    }
+
+    const char *expected_base = strrchr(expected, '/');
+    const char *actual_base = strrchr(actual, '/');
+    expected_base = (expected_base == NULL) ? expected : expected_base + 1;
+    actual_base = (actual_base == NULL) ? actual : actual_base + 1;
+    if (strcmp(expected_base, actual_base) == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
 static void format_escaped_string(const unsigned char *src, size_t src_len, char *buf, size_t buf_size) {
     static const char hex_chars[] = "0123456789abcdef";
     size_t out = 0;
@@ -726,7 +799,15 @@ static int rule_matches(pid_t pid, const struct deny_rule *rule, const struct us
                 if (!read_tracee_string(pid, actual, value, sizeof(value))) {
                     return 0;
                 }
-                if (strcmp(value, rule->args[i].str_value) != 0) {
+                if ((long)regs->orig_rax == 59 && i == 0) {
+                    if (!execve_path_matches(pid, rule->args[i].str_value, value)) {
+                        return 0;
+                    }
+                } else if (((long)regs->orig_rax == 2 || (long)regs->orig_rax == 83) && i == 0) {
+                    if (!path_strings_match(pid, rule->args[i].str_value, value)) {
+                        return 0;
+                    }
+                } else if (strcmp(value, rule->args[i].str_value) != 0) {
                     return 0;
                 }
             }
