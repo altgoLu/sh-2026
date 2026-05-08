@@ -387,9 +387,10 @@ static int sandbox_syscall_arg_count(long syscall_no) {
     case 0:
     case 1:
     case 2:
+        return 3;
     case 83:
     case 90:
-        return 3;
+        return 2;
     case 22:
     case 32:
         return 1;
@@ -568,8 +569,16 @@ static int load_deny_rules(const char *rule_path) {
 
                 char saved_value = *cursor;
                 *cursor = '\0';
-                arg->type = DENY_ARG_INT;
-                arg->int_value = strtoul(value_start, NULL, 0);
+                char *end = NULL;
+                errno = 0;
+                unsigned long int_value = strtoul(value_start, &end, 0);
+                if (errno == 0 && end != value_start && *end == '\0') {
+                    arg->type = DENY_ARG_INT;
+                    arg->int_value = int_value;
+                } else {
+                    arg->type = DENY_ARG_STRING;
+                    snprintf(arg->str_value, sizeof(arg->str_value), "%s", value_start);
+                }
                 *cursor = saved_value;
             }
         }
@@ -843,7 +852,7 @@ static int rule_matches(pid_t pid, const struct deny_rule *rule, const struct us
                     if (!execve_path_matches(pid, rule->args[i].str_value, value)) {
                         return 0;
                     }
-                } else if (((long)regs->orig_rax == 2 || (long)regs->orig_rax == 83) && i == 0) {
+                } else if (((long)regs->orig_rax == 2 || (long)regs->orig_rax == 83 || (long)regs->orig_rax == 90) && i == 0) {
                     if (!path_strings_match(pid, rule->args[i].str_value, value)) {
                         return 0;
                     }
@@ -885,7 +894,8 @@ static void format_blocked_arg(pid_t pid, long syscall_no, int arg_index, unsign
 
     if ((syscall_no == 2 && arg_index == 0) ||
         (syscall_no == 59 && arg_index == 0) ||
-        (syscall_no == 83 && arg_index == 0)) {
+        (syscall_no == 83 && arg_index == 0) ||
+        (syscall_no == 90 && arg_index == 0)) {
         char str[MAX_RULE_STR];
         if (read_tracee_string(pid, value, str, sizeof(str))) {
             format_escaped_string((unsigned char *)str, strlen(str), buf, buf_size);
@@ -1238,7 +1248,9 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                     return 0;
                 }
                 remaining++;
-                if (!blocked && ptrace(PTRACE_SYSCALL, (pid_t)new_pid, NULL, NULL) == -1 && errno != ESRCH) {
+                if (blocked) {
+                    kill((pid_t)new_pid, SIGKILL);
+                } else if (ptrace(PTRACE_SYSCALL, (pid_t)new_pid, NULL, NULL) == -1 && errno != ESRCH) {
                     print_execution_error();
                     return 0;
                 }
@@ -1389,6 +1401,14 @@ int main() {
                 print_execution_error();
                 free_tokens();
                 continue;
+            }
+            if (tokens[0].type == WORD) {
+                free(tokens[0].value);
+                tokens[0].value = NULL;
+            }
+            if (tokens[1].type == WORD) {
+                free(tokens[1].value);
+                tokens[1].value = NULL;
             }
             for (int i = 2; i < ntok; i++) {
                 tokens[i - 2] = tokens[i];
