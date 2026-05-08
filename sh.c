@@ -96,6 +96,7 @@ struct tracee_state {
     int alive;
     int in_syscall;
     int options_set;
+    int skip_bootstrap_execve;
 };
 
 struct token {
@@ -925,6 +926,7 @@ static void format_blocked_arg(pid_t pid, long syscall_no, int arg_index, unsign
 
     if ((syscall_no == 0 && arg_index == 1) ||
         (syscall_no == 22 && arg_index == 0) ||
+        (syscall_no == 56 && (arg_index == 1 || arg_index == 2 || arg_index == 4)) ||
         (syscall_no == 59 && (arg_index == 1 || arg_index == 2))) {
         snprintf(buf, buf_size, "@x%lx", value);
         return;
@@ -1181,7 +1183,7 @@ static int find_tracee_index(struct tracee_state *tracees, int tracee_count, pid
     return -1;
 }
 
-static int add_tracee(struct tracee_state *tracees, int *tracee_count, pid_t pid) {
+static int add_tracee(struct tracee_state *tracees, int *tracee_count, pid_t pid, int skip_bootstrap_execve) {
     if (find_tracee_index(tracees, *tracee_count, pid) != -1) {
         return 1;
     }
@@ -1193,6 +1195,7 @@ static int add_tracee(struct tracee_state *tracees, int *tracee_count, pid_t pid
     tracees[*tracee_count].alive = 1;
     tracees[*tracee_count].in_syscall = 0;
     tracees[*tracee_count].options_set = 0;
+    tracees[*tracee_count].skip_bootstrap_execve = skip_bootstrap_execve;
     (*tracee_count)++;
     return 1;
 }
@@ -1208,7 +1211,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                           PTRACE_O_TRACECLONE;
 
     for (int i = 0; i < pid_count; i++) {
-        if (!add_tracee(tracees, &tracee_count, pids[i])) {
+        if (!add_tracee(tracees, &tracee_count, pids[i], 1)) {
             print_execution_error();
             return 0;
         }
@@ -1263,7 +1266,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                     print_execution_error();
                     return 0;
                 }
-                if (!add_tracee(tracees, &tracee_count, (pid_t)new_pid)) {
+                if (!add_tracee(tracees, &tracee_count, (pid_t)new_pid, 0)) {
                     print_execution_error();
                     return 0;
                 }
@@ -1283,7 +1286,9 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                         print_execution_error();
                         return 0;
                     }
-                    if (!blocked && syscall_matches_deny_list(pid, &regs) != -1) {
+                    if (tracees[index].skip_bootstrap_execve && (long)regs.orig_rax == 59) {
+                        tracees[index].skip_bootstrap_execve = 0;
+                    } else if (!blocked && syscall_matches_deny_list(pid, &regs) != -1) {
                         print_blocked_syscall_from_regs(pid, &regs);
                         blocked = 1;
                         for (int i = 0; i < tracee_count; i++) {
