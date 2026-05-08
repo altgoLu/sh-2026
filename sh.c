@@ -650,8 +650,6 @@ static int build_path_from_base(const char *base, const char *path, char *buf, s
 }
 
 static int expand_user_path(const char *path, const char *home, const char *base, char *buf, size_t buf_size) {
-    char expanded[PATH_MAX];
-
     if (path == NULL || path[0] == '\0') {
         return 0;
     }
@@ -661,14 +659,15 @@ static int expand_user_path(const char *path, const char *home, const char *base
             return 0;
         }
         if (path[1] == '\0') {
-            return snprintf(expanded, sizeof(expanded), "%s", home) < (int)sizeof(expanded);
+            return snprintf(buf, buf_size, "%s", home) < (int)buf_size;
         }
         if (path[1] == '/') {
-            return snprintf(expanded, sizeof(expanded), "%s/%s", home, path + 2) < (int)sizeof(expanded);
+            return snprintf(buf, buf_size, "%s/%s", home, path + 2) < (int)buf_size;
         }
         return 0;
     }
 
+    char expanded[PATH_MAX];
     if (!build_path_from_base(base, path, expanded, sizeof(expanded))) {
         return 0;
     }
@@ -730,6 +729,10 @@ static int path_strings_match(pid_t pid, const char *expected, const char *actua
 static int execve_path_matches(pid_t pid, const char *expected, const char *actual) {
     if (path_strings_match(pid, expected, actual)) {
         return 1;
+    }
+
+    if (strchr(expected, '/') != NULL) {
+        return 0;
     }
 
     const char *expected_base = strrchr(expected, '/');
