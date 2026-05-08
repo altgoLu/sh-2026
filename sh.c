@@ -633,6 +633,53 @@ static int read_tracee_bytes(pid_t pid, unsigned long addr, unsigned char *buf, 
     return 1;
 }
 
+static int build_path_from_base(const char *base, const char *path, char *buf, size_t buf_size) {
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+
+    if (path[0] == '/') {
+        return snprintf(buf, buf_size, "%s", path) < (int)buf_size;
+    }
+
+    if (base == NULL || base[0] == '\0') {
+        return 0;
+    }
+
+    return snprintf(buf, buf_size, "%s/%s", base, path) < (int)buf_size;
+}
+
+static int expand_user_path(const char *path, const char *home, const char *base, char *buf, size_t buf_size) {
+    char expanded[PATH_MAX];
+
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+
+    if (path[0] == '~') {
+        if (home == NULL) {
+            return 0;
+        }
+        if (path[1] == '\0') {
+            return snprintf(expanded, sizeof(expanded), "%s", home) < (int)sizeof(expanded);
+        }
+        if (path[1] == '/') {
+            return snprintf(expanded, sizeof(expanded), "%s/%s", home, path + 2) < (int)sizeof(expanded);
+        }
+        return 0;
+    }
+
+    if (!build_path_from_base(base, path, expanded, sizeof(expanded))) {
+        return 0;
+    }
+
+    if (realpath(expanded, buf) != NULL) {
+        return 1;
+    }
+
+    return snprintf(buf, buf_size, "%s", expanded) < (int)buf_size;
+}
+
 static int read_tracee_cwd(pid_t pid, char *buf, size_t buf_size) {
     char proc_path[64];
     ssize_t len;
@@ -652,26 +699,16 @@ static int read_tracee_cwd(pid_t pid, char *buf, size_t buf_size) {
 
 static int resolve_path_for_pid(pid_t pid, const char *path, char *resolved, size_t resolved_size) {
     char cwd[PATH_MAX];
-    char candidate[PATH_MAX];
 
     if (path == NULL || path[0] == '\0') {
         return 0;
     }
 
-    if (path[0] == '/') {
-        if (snprintf(candidate, sizeof(candidate), "%s", path) >= (int)sizeof(candidate)) {
-            return 0;
-        }
-    } else {
-        if (!read_tracee_cwd(pid, cwd, sizeof(cwd))) {
-            return 0;
-        }
-        if (snprintf(candidate, sizeof(candidate), "%s/%s", cwd, path) >= (int)sizeof(candidate)) {
-            return 0;
-        }
+    if (!read_tracee_cwd(pid, cwd, sizeof(cwd))) {
+        return 0;
     }
 
-    return realpath(candidate, resolved) != NULL;
+    return expand_user_path(path, NULL, cwd, resolved, resolved_size);
 }
 
 static int path_strings_match(pid_t pid, const char *expected, const char *actual) {
@@ -992,18 +1029,18 @@ static int run_cd(struct command *cmd) {
     if (strcmp(target, "~") == 0) {
         target = getenv("HOME");
     } else if (strncmp(target, "~/", 2) == 0) {
-        char *home = getenv("HOME");
-        if (home == NULL) {
-            print_execution_error();
-            return 0;
-        }
-        if (snprintf(expanded_target, sizeof(expanded_target), "%s/%s", home, target + 2) >= (int)sizeof(expanded_target)) {
-            print_execution_error();
-            return 0;
-        }
         target = expanded_target;
+        if (!expand_user_path(cmd->argv[1], getenv("HOME"), oldpwd, expanded_target, sizeof(expanded_target))) {
+            print_execution_error();
+            return 0;
+        }
     } else if (strcmp(target, "-") == 0) {
         target = getenv("OLDPWD");
+    } else if (!expand_user_path(target, getenv("HOME"), oldpwd, expanded_target, sizeof(expanded_target))) {
+        print_execution_error();
+        return 0;
+    } else {
+        target = expanded_target;
     }
 
     if (target == NULL || chdir(target) != 0) {
@@ -1044,14 +1081,22 @@ static int run_env_use(struct command *cmd) {
         }
     }
 
-    size_t new_path_len = strlen(cmd->argv[1]) + strlen("/bin:") + strlen(original_path) + 1;
+    char resolved_path[PATH_MAX];
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == NULL ||
+        !expand_user_path(cmd->argv[1], getenv("HOME"), cwd, resolved_path, sizeof(resolved_path))) {
+        print_execution_error();
+        return 0;
+    }
+
+    size_t new_path_len = strlen(resolved_path) + strlen("/bin:") + strlen(original_path) + 1;
     char *new_path = malloc(new_path_len);
     if (new_path == NULL) {
         print_execution_error();
         return 0;
     }
 
-    snprintf(new_path, new_path_len, "%s/bin:%s", cmd->argv[1], original_path);
+    snprintf(new_path, new_path_len, "%s/bin:%s", resolved_path, original_path);
     if (setenv("PATH", new_path, 1) != 0) {
         free(new_path);
         print_execution_error();
