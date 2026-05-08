@@ -96,6 +96,7 @@ struct tracee_state {
     int alive;
     int in_syscall;
     int options_set;
+    int setup_complete;
     int skip_bootstrap_execve;
 };
 
@@ -1183,7 +1184,8 @@ static int find_tracee_index(struct tracee_state *tracees, int tracee_count, pid
     return -1;
 }
 
-static int add_tracee(struct tracee_state *tracees, int *tracee_count, pid_t pid, int skip_bootstrap_execve) {
+static int add_tracee(struct tracee_state *tracees, int *tracee_count, pid_t pid,
+                      int setup_complete, int skip_bootstrap_execve) {
     if (find_tracee_index(tracees, *tracee_count, pid) != -1) {
         return 1;
     }
@@ -1195,6 +1197,7 @@ static int add_tracee(struct tracee_state *tracees, int *tracee_count, pid_t pid
     tracees[*tracee_count].alive = 1;
     tracees[*tracee_count].in_syscall = 0;
     tracees[*tracee_count].options_set = 0;
+    tracees[*tracee_count].setup_complete = setup_complete;
     tracees[*tracee_count].skip_bootstrap_execve = skip_bootstrap_execve;
     (*tracee_count)++;
     return 1;
@@ -1211,7 +1214,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                           PTRACE_O_TRACECLONE;
 
     for (int i = 0; i < pid_count; i++) {
-        if (!add_tracee(tracees, &tracee_count, pids[i], 1)) {
+        if (!add_tracee(tracees, &tracee_count, pids[i], 0, 1)) {
             print_execution_error();
             return 0;
         }
@@ -1259,6 +1262,15 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                 tracees[index].options_set = 1;
             }
 
+            if (!tracees[index].setup_complete && WSTOPSIG(status) == SIGSTOP) {
+                tracees[index].setup_complete = 1;
+                if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1 && errno != ESRCH) {
+                    print_execution_error();
+                    return 0;
+                }
+                continue;
+            }
+
             unsigned int event = (unsigned int)status >> 16;
             if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
                 unsigned long new_pid = 0;
@@ -1266,7 +1278,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                     print_execution_error();
                     return 0;
                 }
-                if (!add_tracee(tracees, &tracee_count, (pid_t)new_pid, 0)) {
+                if (!add_tracee(tracees, &tracee_count, (pid_t)new_pid, 1, 0)) {
                     print_execution_error();
                     return 0;
                 }
@@ -1364,6 +1376,9 @@ int execute(struct job *j, int sandbox_enabled, const char *rule_path) {
                 _exit(EXIT_EXEC_ERROR);
             }
             close_all_pipes(pipes, pipe_count);
+            if (sandbox_enabled) {
+                raise(SIGSTOP);
+            }
             int builtin_result = run_builtin(&j->cmds[i], 0);
             if (builtin_result != -1) {
                 _exit(builtin_result == 0 ? 0 : EXIT_EXEC_ERROR);
