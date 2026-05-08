@@ -705,6 +705,18 @@ static int read_tracee_cwd(pid_t pid, char *buf, size_t buf_size) {
     return 1;
 }
 
+static int canonicalize_existing_path(const char *path, char *buf, size_t buf_size) {
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+
+    if (realpath(path, buf) != NULL) {
+        return 1;
+    }
+
+    return snprintf(buf, buf_size, "%s", path) < (int)buf_size;
+}
+
 static int resolve_path_for_pid(pid_t pid, const char *path, char *resolved, size_t resolved_size) {
     char cwd[PATH_MAX];
 
@@ -727,9 +739,17 @@ static int path_strings_match(pid_t pid, const char *expected, const char *actua
     char resolved_expected[PATH_MAX];
     char resolved_actual[PATH_MAX];
     if (resolve_path_for_pid(pid, expected, resolved_expected, sizeof(resolved_expected)) &&
-        resolve_path_for_pid(pid, actual, resolved_actual, sizeof(resolved_actual)) &&
-        strcmp(resolved_expected, resolved_actual) == 0) {
-        return 1;
+        resolve_path_for_pid(pid, actual, resolved_actual, sizeof(resolved_actual))) {
+        char canon_expected[PATH_MAX];
+        char canon_actual[PATH_MAX];
+        if (canonicalize_existing_path(resolved_expected, canon_expected, sizeof(canon_expected)) &&
+            canonicalize_existing_path(resolved_actual, canon_actual, sizeof(canon_actual)) &&
+            strcmp(canon_expected, canon_actual) == 0) {
+            return 1;
+        }
+        if (strcmp(resolved_expected, resolved_actual) == 0) {
+            return 1;
+        }
     }
 
     return 0;
