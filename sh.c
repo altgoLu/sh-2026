@@ -1298,9 +1298,7 @@ static int wait_for_sandbox_children(pid_t *pids, int pid_count) {
                         print_execution_error();
                         return 0;
                     }
-                    if (tracees[index].skip_bootstrap_execve && (long)regs.orig_rax == 59) {
-                        tracees[index].skip_bootstrap_execve = 0;
-                    } else if (!blocked && syscall_matches_deny_list(pid, &regs) != -1) {
+                    if (!blocked && syscall_matches_deny_list(pid, &regs) != -1) {
                         print_blocked_syscall_from_regs(pid, &regs);
                         blocked = 1;
                         for (int i = 0; i < tracee_count; i++) {
