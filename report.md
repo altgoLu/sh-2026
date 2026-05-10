@@ -38,6 +38,8 @@
 
 还有一个 bug 来自 `bash -c` 测试。由于最初 tokenizer 不支持引号，`bash -c 'ls | head -n 1'` 会被错误解析成 Shell 自己的管道，导致 sandbox 监控对象和预期完全不同。加入引号处理后，这类命令能正确作为 `bash` 的参数传递。
 
+最后两处修正把分数从 97.18% 推到 99.76%。一是 `print_blocked_syscall` 打印指针型参数时的前缀：早期按文档措辞用 `@x`，后来改用 `0x` 才与评测对齐。二是 sandbox 子进程第一次 `execve` 的处理：之前把它当作 Shell 启动命令的"引导"动作主动跳过，但评测期望这次 `execve` 同样要参与规则匹配，于是去掉了跳过逻辑，让子进程从第一次 `execve` 起就被规则约束。
+
 ## 测试情况
 
 本地主要使用 `make sh` 编译，并通过构造输入文件喂给 `./sh` 的方式测试。覆盖的用例包括：
@@ -47,4 +49,4 @@
 - 管道和重定向：`ls | sort`、`echo hi > file`、非法管道和非法重定向。
 - sandbox：禁止 `write`、禁止 `execve`、带参数的 `deny:write arg0=1 arg1="..."`、路径型 `execve arg0`、以及被监控程序内部继续 fork/exec 的情况。
 
-最后通过 `make submit` 和 `make score` 在 OJ 上验证。当前主要功能已经完成，分数达到 97.18%，剩余隐藏用例大概率集中在更细的边界行为或输出格式差异上。
+最后通过 `make submit` 和 `make score` 在 OJ 上验证。当前主要功能已经完成，分数达到 99.76%。
