@@ -929,7 +929,7 @@ static void format_blocked_arg(pid_t pid, long syscall_no, int arg_index, unsign
         (syscall_no == 22 && arg_index == 0) ||
         (syscall_no == 56 && (arg_index == 1 || arg_index == 2 || arg_index == 4)) ||
         (syscall_no == 59 && (arg_index == 1 || arg_index == 2))) {
-        snprintf(buf, buf_size, "@x%lx", value);
+        snprintf(buf, buf_size, "0x%lx", value);
         return;
     }
 
