@@ -310,6 +310,9 @@ int parser(struct job *j) {
             if (!finish_command(j, &current)) {
                 return 0;
             }
+            if (i + 1 >= ntok) {
+                return 0;
+            }
             break;
         }
     }
