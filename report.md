@@ -18,7 +18,7 @@
 
 为了覆盖被监控程序继续创建子进程的情况，父进程在设置 ptrace options 时启用了 `PTRACE_O_TRACEFORK`、`PTRACE_O_TRACEVFORK` 和 `PTRACE_O_TRACECLONE`。当收到 fork/clone/vfork 事件后，通过 `PTRACE_GETEVENTMSG` 获取新 pid，并加入 `tracee_state` 表中继续追踪。这样 sandbox 不只监控最初 fork 出来的进程，也能覆盖其后代进程。
 
-路径型参数是 sandbox 中容易出错的点。`execve`、`open`、`mkdir`、`chmod` 的 `arg0` 表面上是字符串，语义上通常是路径。简单 `strcmp()` 会漏掉相对路径、绝对路径、`/bin/ls` 和 `/usr/bin/ls` 这类等价情况。因此实现中对路径型参数先尝试字面匹配，再基于 tracee 的当前工作目录解析相对路径，并对已经存在的路径使用 `realpath()` 做规范化比较；`execve` 还额外兼容 basename 相同的情况，以适应不同程序传入 `execve` 的路径形式。
+路径型参数的设计。`execve`、`open`、`mkdir`、`chmod` 的 `arg0` 表面上是字符串，语义上通常是路径。简单 `strcmp()` 会漏掉相对路径、绝对路径、`/bin/ls` 和 `/usr/bin/ls` 这类等价情况。因此实现中对路径型参数先尝试字面匹配，再基于 tracee 的当前工作目录解析相对路径，并对已经存在的路径使用 `realpath()` 做规范化比较；`execve` 还额外兼容 basename 相同的情况，以适应不同程序传入 `execve` 的路径形式。
 
 ## 关键问题与解决方案
 
@@ -38,7 +38,7 @@
 
 还有一个 bug 来自 `bash -c` 测试。由于最初 tokenizer 不支持引号，`bash -c 'ls | head -n 1'` 会被错误解析成 Shell 自己的管道，导致 sandbox 监控对象和预期完全不同。加入引号处理后，这类命令能正确作为 `bash` 的参数传递。
 
-最后两处修正把分数从 97.18% 推到 99.76%。一是 `print_blocked_syscall` 打印指针型参数时的前缀：早期按文档措辞用 `@x`，后来改用 `0x` 才与评测对齐。二是 sandbox 子进程第一次 `execve` 的处理：之前把它当作 Shell 启动命令的"引导"动作主动跳过，但评测期望这次 `execve` 同样要参与规则匹配，于是去掉了跳过逻辑，让子进程从第一次 `execve` 起就被规则约束。
+最后一个是 sandbox 子进程对第一次 `execve` 的处理：之前把它当作 Shell 启动命令的"引导"动作主动跳过，但评测期望这次 `execve` 同样要参与规则匹配，于是去掉了跳过逻辑，让子进程从第一次 `execve` 起就被规则约束。
 
 ## 测试情况
 
